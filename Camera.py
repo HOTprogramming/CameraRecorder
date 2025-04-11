@@ -4,6 +4,7 @@ from datetime import datetime
 from networktables import NetworkTables
 import time
 from Utils import RingBuffer
+import threading
 
 test = False
     
@@ -15,11 +16,11 @@ def main():
 
     sd = NetworkTables.getTable("SmartDashboard")
 
-    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(1)
 
-    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    # cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 
     ret, frame = cap.read()
     if not ret:
@@ -51,7 +52,7 @@ def main():
     print("Press 'q' to quit.")
     while True:
         
-        en = sd.getBoolean("Enabled", False)
+        en = sd.getBoolean("Teleop", False)
 
         if not manual:
             recording = en
@@ -111,11 +112,8 @@ def main():
             bufferTime = time.time()
 
         if buffer == False and prevBuffer != buffer:
-            for frame in frames:
-                output.write(frame)
-
-            output.release()
-            os.startfile(file_name)
+            thread = threading.Thread(target=writeandplay, args=(frames, output, file_name), daemon=True)
+            thread.start()
 
             frames = []
 
@@ -135,6 +133,12 @@ def main():
     os.remove(file_name)
 
 
+def writeandplay(frames, output, file_name):
+    for frame in frames:
+        output.write(frame)
+
+    output.release()
+    os.startfile(file_name)
 
 
 if __name__ == "__main__":
