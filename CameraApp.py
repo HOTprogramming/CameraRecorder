@@ -4,6 +4,7 @@ import cv2
 import time
 from collections import deque
 from Utils import RingBuffer
+import threading
 try:
     from networktables import NetworkTables
 except Exception:
@@ -61,6 +62,8 @@ class CameraApp(QWidget):
         self._record_start_ts = None
         self.recording = False
         self.record_writer = None
+        # lock to protect record buffer when using background threads
+        self._record_lock = threading.Lock()
         # timestamp when current recording started (for on-frame timer)
         self._rec_start_time = None
         # post-roll settings (seconds) and state
@@ -71,6 +74,8 @@ class CameraApp(QWidget):
         self._preroll_seconds = 2
         # NetworkTables boolean key name to look for (default 'Teleop')
         self._nt_bool_key = 'Teleop'
+        # default recording resolution (width, height)
+        self._resolution = (640, 480)
         # where to save recordings (can be configured via Settings)
         try:
             default_videos = Path.home() / 'Videos'
@@ -99,7 +104,8 @@ class CameraApp(QWidget):
 
         # NetworkTables server input + connect
         self.nt_ip_edit = QLineEdit()
-        self.nt_ip_edit.setFixedWidth(140)
+        self.nt_ip_edit.setFixedWidth(60)
+        self.nt_ip_edit.setPlaceholderText("0")
         self.nt_connect_btn = QPushButton("Connect NT")
         self.nt_status = QLabel("NT: disabled")
         # save the IP when the user finishes editing the field
@@ -132,7 +138,7 @@ class CameraApp(QWidget):
         controls.addWidget(self.stop_btn)
 
         # NetworkTables controls
-        controls.addWidget(QLabel("NT IP:"))
+        controls.addWidget(QLabel("Team #:"))
         controls.addWidget(self.nt_ip_edit)
         controls.addWidget(self.nt_connect_btn)
         controls.addWidget(self.nt_status)
@@ -165,7 +171,8 @@ class CameraApp(QWidget):
         self.refresh_cameras()
 
         # NT default ip and auto-connect attempt
-        self._nt_server_ip = "10.0.67.2"
+        self._nt_server_ip = "10.0.67.1"
+        self._nt_team_number = 67
         self.nt_connect_btn.clicked.connect(self._on_nt_connect_clicked)
         # config path: prefer %APPDATA%/CameraRecorder/config.json on Windows; migrate legacy home file if present
         try:
@@ -249,8 +256,31 @@ class CameraApp(QWidget):
         except Exception:
             pass
 
+    def _team_to_ip(self, team_str: str) -> str:
+        """Convert team number string to IP address. 0 = localhost, else 10.0.{team}.1"""
+        try:
+            team = int(team_str.strip())
+            if team == 0:
+                return "127.0.0.1"
+            else:
+                return f"10.0.{team}.1"
+        except Exception:
+            return "10.0.67.1"  # fallback default
+
+    def _ip_to_team(self, ip: str) -> str:
+        """Extract team number from IP address for display."""
+        try:
+            if ip == "127.0.0.1":
+                return "0"
+            parts = ip.split('.')
+            if len(parts) == 4 and parts[0] == '10' and parts[1] == '0':
+                return parts[2]
+            return "67"  # fallback
+        except Exception:
+            return "67"
+
     def open_settings_dialog(self):
-        d = SettingsDialog(self, preroll=self._preroll_seconds, postroll=self._postroll_seconds, record_path=self._record_path, nt_bool_key=self._nt_bool_key)
+        d = SettingsDialog(self, preroll=self._preroll_seconds, postroll=self._postroll_seconds, record_path=self._record_path, nt_bool_key=self._nt_bool_key, resolution=getattr(self, '_resolution', (640, 480)))
         if d.exec_() == QDialog.Accepted:
             # apply settings
             self._preroll_seconds = int(d.preroll_spin.value())
@@ -297,6 +327,21 @@ class CameraApp(QWidget):
                         self.ring_buffer.add_frame(fr)
                     except Exception:
                         pass
+            except Exception:
+                pass
+
+            # apply resolution change
+            try:
+                rw = int(d.res_w_spin.value())
+                rh = int(d.res_h_spin.value())
+                self._resolution = (rw, rh)
+                # apply immediately if camera is open
+                try:
+                    if getattr(self, 'cap', None) is not None:
+                        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
+                        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -358,12 +403,18 @@ class CameraApp(QWidget):
             QMessageBox.critical(self, "Camera Error", f"Could not open camera {cam_index}.")
             return
 
-        # Optional: set resolution (comment out if you want default)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        # Optional: set resolution (from settings)
+        try:
+            w, h = getattr(self, '_resolution', (640, 480))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+        except Exception:
+            pass
+        try:
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        except Exception:
+            pass
 
-        self.timer.start(30)  # ~33 fps
         # Recording buttons: allow recording while camera is running
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -406,6 +457,8 @@ class CameraApp(QWidget):
         # manual mode (user started/stopped recording) — when False, network Teleop controls recording
         self._manual = False
 
+        self.timer.start(30)  # ~33 fps
+
         # NetworkTables handle (connected via UI)
         self._nt = None
         # Note: connection attempted at startup using the default IP field above (if present)
@@ -442,7 +495,6 @@ class CameraApp(QWidget):
 
         ret, frame = self.cap.read()
         if not ret:
-            self.video_label.setText("Failed to read frame.")
             return
 
         # record timestamp for FPS estimation
@@ -463,14 +515,10 @@ class CameraApp(QWidget):
 
             status_text = str(self.recording)
             cv2.putText(frame, status_text, pos_status, font, font_scale, color, thickness, cv2.LINE_AA)
-            # elapsed: use recording start time during recording or post-roll, otherwise show global timer
-            if (self.recording or getattr(self, '_postroll_active', False)) and self._rec_start_time is not None:
-                elapsed = time.time() - self._rec_start_time
-            else:
-                # if global timer not set, fall back to now-zero
-                if getattr(self, '_global_timer_start', None) is None:
-                    self._global_timer_start = time.time()
-                elapsed = time.time() - self._global_timer_start
+            # elapsed: continuous timer that only resets on start_recording
+            if getattr(self, '_global_timer_start', None) is None:
+                self._global_timer_start = time.time()
+            elapsed = time.time() - self._global_timer_start
 
             time_text = f"{elapsed:.1f}s"
             cv2.putText(frame, time_text, pos_time, font, font_scale, color, thickness, cv2.LINE_AA)
@@ -481,9 +529,14 @@ class CameraApp(QWidget):
         if getattr(self, 'recording', False) or getattr(self, '_postroll_active', False):
             ts = now
             try:
-                self._record_frames.append((ts, frame.copy()))
+                with self._record_lock:
+                    self._record_frames.append((ts, frame.copy()))
             except Exception:
-                self._record_frames.append((ts, frame))
+                try:
+                    with self._record_lock:
+                        self._record_frames.append((ts, frame))
+                except Exception:
+                    pass
         else:
             # maintain ring buffer when not recording (pre-roll)
             try:
@@ -655,11 +708,14 @@ class CameraApp(QWidget):
             except Exception:
                 rec_frames.append((ts_i, frm))
 
-        self._record_frames = rec_frames
-        self._record_start_ts = self._record_frames[0][0] if self._record_frames else now
+        with self._record_lock:
+            self._record_frames = rec_frames
+            self._record_start_ts = self._record_frames[0][0] if self._record_frames else now
         self._desired_filename = filename
         self.recording = True
         self._rec_start_time = time.time()
+        # reset the global timer so it starts counting from zero for this recording
+        self._global_timer_start = time.time()
         # entering manual mode if requested (UI/keyboard); automated starts (Teleop) don't set manual
         self._manual = bool(manual)
         self.start_btn.setEnabled(False)
@@ -684,10 +740,20 @@ class CameraApp(QWidget):
             print(f"[CFG] loaded cfg={cfg}")
 
             nt_block = cfg.get('nt') if isinstance(cfg.get('nt'), dict) else {}
+            team_num = nt_block.get('team_number') if nt_block else None
             ip = nt_block.get('server_ip') if nt_block else None
-            if ip:
+            
+            if team_num:
+                self.nt_ip_edit.setText(str(team_num))
+                if ip:
+                    self._nt_server_ip = ip
+                else:
+                    self._nt_server_ip = self._team_to_ip(str(team_num))
+            elif ip:
+                # legacy: convert IP to team number for display
                 self._nt_server_ip = ip
-                self.nt_ip_edit.setText(ip)
+                team = self._ip_to_team(ip)
+                self.nt_ip_edit.setText(team)
             # networktables boolean key
             try:
                 nt_key = nt_block.get('boolean_key') if nt_block else None
@@ -763,6 +829,27 @@ class CameraApp(QWidget):
                         pass
                 except Exception:
                     pass
+
+            # resolution
+            try:
+                res = cfg.get('settings', {}).get('resolution')
+            except Exception:
+                res = None
+            if res and isinstance(res, dict):
+                try:
+                    rw = int(res.get('w', 0))
+                    rh = int(res.get('h', 0))
+                    if rw > 0 and rh > 0:
+                        self._resolution = (rw, rh)
+                        # apply to open camera if present
+                        try:
+                            if getattr(self, 'cap', None) is not None:
+                                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
+                                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             # update config path label (show where settings are stored)
             try:
                 self._update_config_path_label()
@@ -809,15 +896,16 @@ class CameraApp(QWidget):
 
             # set nt (prefer the explicit text field, otherwise last known server ip)
             cfg.setdefault('nt', {})
-            current_ip = self.nt_ip_edit.text().strip()
-            last_ip = getattr(self, '_nt_server_ip', '') or cfg['nt'].get('server_ip', '')
-            if current_ip:
-                cfg['nt']['server_ip'] = current_ip
-            elif last_ip:
-                cfg['nt']['server_ip'] = last_ip
+            current_team = self.nt_ip_edit.text().strip()
+            if current_team:
+                # save team number and computed IP
+                cfg['nt']['team_number'] = current_team
+                cfg['nt']['server_ip'] = self._team_to_ip(current_team)
             else:
-                # keep empty string if nothing available
-                cfg['nt']['server_ip'] = ''
+                # fallback to stored values
+                last_ip = getattr(self, '_nt_server_ip', '') or cfg['nt'].get('server_ip', '')
+                cfg['nt']['server_ip'] = last_ip
+                cfg['nt']['team_number'] = self._ip_to_team(last_ip)
             # persist the boolean key name
             try:
                 cfg['nt']['boolean_key'] = str(getattr(self, '_nt_bool_key', 'Teleop'))
@@ -834,6 +922,13 @@ class CameraApp(QWidget):
             cfg['settings']['postroll_seconds'] = int(getattr(self, '_postroll_seconds', 2))
             # pre-roll seconds
             cfg['settings']['pre_roll_seconds'] = int(getattr(self, '_preroll_seconds', 2))
+            # resolution
+            try:
+                cfg.setdefault('settings', {})
+                w, h = getattr(self, '_resolution', (640, 480))
+                cfg['settings']['resolution'] = {'w': int(w), 'h': int(h)}
+            except Exception:
+                pass
             # record path
             cfg['settings']['record_path'] = str(getattr(self, '_record_path', ''))
 
@@ -849,10 +944,11 @@ class CameraApp(QWidget):
             pass
 
     def _on_nt_connect_clicked(self):
-        ip = self.nt_ip_edit.text().strip()
-        if not ip:
-            QMessageBox.warning(self, "NetworkTables", "Please enter an IP address.")
+        team_str = self.nt_ip_edit.text().strip()
+        if not team_str:
+            QMessageBox.warning(self, "NetworkTables", "Please enter a team number.")
             return
+        ip = self._team_to_ip(team_str)
         self._connect_networktables(ip)
 
     def _open_recordings_folder(self):
@@ -915,73 +1011,21 @@ class CameraApp(QWidget):
         self.setWindowTitle(f"PyQt5 Camera Switcher - Post-roll ({seconds}s)")
 
     def _finalize_recording(self):
-        """Internal: write buffered frames to file and clean up."""
-        frames = getattr(self, '_record_frames', [])
-        n = len(frames)
-        if n == 0:
-            self.recording = False
-            self._postroll_active = False
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self.setWindowTitle("PyQt5 Camera Switcher")
-            return
-
-        t0 = frames[0][0]
-        t1 = frames[-1][0]
-        span = t1 - t0 if t1 > t0 else 0.0
-        if span > 0 and n >= 2:
-            fps = (n - 1) / span
-        else:
-            # fallback to camera/timer fps
-            try:
-                cap_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
-            except Exception:
-                cap_fps = 0.0
-            timer_interval = self.timer.interval() if hasattr(self, 'timer') and self.timer is not None else 30
-            timer_fps = 1000.0 / timer_interval if timer_interval > 0 else 30.0
-            fps = cap_fps if cap_fps and cap_fps > 1.0 else float(round(timer_fps))
-
-        fps = max(1.0, min(120.0, float(fps)))
-
-        # get frame size from first frame
-        first_frame = frames[0][1]
-        h, w = first_frame.shape[:2]
-
-        filename = getattr(self, '_desired_filename', f'record_{self.current_camera_index}_{int(time.time())}.mp4')
-        print(f"[REC] Finalizing recording: frames={n}, span={span:.3f}, fps={fps:.2f}, filename={filename}")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        """Internal: swap buffered frames out and offload encoding/writing to a background thread."""
+        # swap buffers under lock so recording can continue independently
         try:
-            writer = cv2.VideoWriter(filename, fourcc, fps, (w, h))
-            if not writer.isOpened():
-                raise RuntimeError('VideoWriter failed to open')
-        except Exception as e:
-            QMessageBox.critical(self, "Recording Error", f"Could not write recording file:\n{e}")
-            # clear buffer and reset state
-            self._record_frames = []
-            self.recording = False
-            self._postroll_active = False
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self.setWindowTitle("PyQt5 Camera Switcher")
-            return
-
-        # write buffered frames
-        for _, frm in frames:
+            with self._record_lock:
+                frames = list(getattr(self, '_record_frames', []))
+                # empty the main buffer for future recordings
+                self._record_frames = []
+        except Exception:
+            frames = list(getattr(self, '_record_frames', []))
             try:
-                writer.write(frm)
+                self._record_frames = []
             except Exception:
                 pass
 
-        writer.release()
-
-        # open the recorded file (Windows)
-        try:
-            os.startfile(filename)
-        except Exception:
-            pass
-
-        # reset state
-        self._record_frames = []
+        # reset UI/state immediately
         self.recording = False
         self._postroll_active = False
         self._rec_start_time = None
@@ -989,9 +1033,90 @@ class CameraApp(QWidget):
         self.stop_btn.setEnabled(False)
         self.setWindowTitle("PyQt5 Camera Switcher")
 
+        n = len(frames)
+        if n == 0:
+            print("[REC] finalize called but no frames to write")
+            return
+
+        filename = getattr(self, '_desired_filename', f'record_{self.current_camera_index}_{int(time.time())}.mp4')
+        print(f"[REC] Finalizing recording in background: frames={n}, filename={filename}")
+
+        # start background thread to encode & save
+        try:
+            t = threading.Thread(target=self._encode_and_save, args=(frames, filename))
+            t.daemon = True
+            t.start()
+        except Exception as e:
+            print(f"[REC] failed to start background encode thread: {e}")
+            # fall back to synchronous encode
+            try:
+                self._encode_and_save(frames, filename)
+            except Exception:
+                pass
+
+    def _encode_and_save(self, frames, filename):
+        """Background worker: compute fps from timestamps and write frames to MP4."""
+        try:
+            n = len(frames)
+            if n == 0:
+                print("[ENC] no frames to encode")
+                return
+            t0 = frames[0][0]
+            t1 = frames[-1][0]
+            span = t1 - t0 if t1 > t0 else 0.0
+            if span > 0 and n >= 2:
+                fps = (n - 1) / span
+            else:
+                # fallback to camera/timer fps
+                try:
+                    cap_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                except Exception:
+                    cap_fps = 0.0
+                timer_interval = self.timer.interval() if hasattr(self, 'timer') and self.timer is not None else 30
+                timer_fps = 1000.0 / timer_interval if timer_interval > 0 else 30.0
+                fps = cap_fps if cap_fps and cap_fps > 1.0 else float(round(timer_fps))
+
+            fps = max(1.0, min(120.0, float(fps)))
+
+            first_frame = frames[0][1]
+            h, w = first_frame.shape[:2]
+
+            print(f"[ENC] encoding {n} frames span={span:.3f} fps={fps:.2f} -> {filename}")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            try:
+                writer = cv2.VideoWriter(filename, fourcc, fps, (w, h))
+                if not writer.isOpened():
+                    raise RuntimeError('VideoWriter failed to open')
+            except Exception as e:
+                print(f"[ENC] VideoWriter open failed: {e}")
+                # inform user on UI thread
+                try:
+                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Recording Error", f"Could not write recording file:\n{e}"))
+                except Exception:
+                    pass
+                return
+
+            for _, frm in frames:
+                try:
+                    writer.write(frm)
+                except Exception:
+                    pass
+
+            writer.release()
+
+            # try to open the recorded file (Windows)
+            try:
+                os.startfile(filename)
+            except Exception:
+                pass
+
+            print(f"[ENC] done writing {filename}")
+        except Exception as e:
+            print(f"[ENC] exception during encode: {e}")
+
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, preroll: int = 2, postroll: int = 2, record_path: str = "", nt_bool_key: str = 'Teleop'):
+    def __init__(self, parent=None, preroll: int = 2, postroll: int = 2, record_path: str = "", nt_bool_key: str = 'Teleop', resolution: tuple = (640, 480)):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
@@ -1008,13 +1133,63 @@ class SettingsDialog(QDialog):
         layout.addLayout(hl0)
 
         # Post-roll
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("Post-roll (s):"))
+        hl_post = QHBoxLayout()
+        hl_post.addWidget(QLabel("Post-roll (s):"))
         self.postroll_spin = QSpinBox()
         self.postroll_spin.setRange(0, 60)
         self.postroll_spin.setValue(int(postroll))
-        hl.addWidget(self.postroll_spin)
-        layout.addLayout(hl)
+        hl_post.addWidget(self.postroll_spin)
+        layout.addLayout(hl_post)
+
+        # Resolution
+        hl_res = QHBoxLayout()
+        hl_res.addWidget(QLabel("Resolution:"))
+        self.res_combo = QComboBox()
+        self.res_combo.addItems(["640x480", "1280x720", "1920x1080", "Custom"])
+        hl_res.addWidget(self.res_combo)
+        self.res_w_spin = QSpinBox()
+        self.res_w_spin.setRange(160, 7680)
+        self.res_w_spin.setValue(640)
+        self.res_h_spin = QSpinBox()
+        self.res_h_spin.setRange(120, 4320)
+        self.res_h_spin.setValue(480)
+        self.res_w_spin.setFixedWidth(90)
+        self.res_h_spin.setFixedWidth(90)
+        hl_res.addWidget(self.res_w_spin)
+        hl_res.addWidget(self.res_h_spin)
+        layout.addLayout(hl_res)
+
+        def _on_res_combo(idx):
+            txt = self.res_combo.currentText()
+            if txt == '640x480':
+                self.res_w_spin.setValue(640)
+                self.res_h_spin.setValue(480)
+                self.res_w_spin.setEnabled(False)
+                self.res_h_spin.setEnabled(False)
+            elif txt == '1280x720':
+                self.res_w_spin.setValue(1280)
+                self.res_h_spin.setValue(720)
+                self.res_w_spin.setEnabled(False)
+                self.res_h_spin.setEnabled(False)
+            elif txt == '1920x1080':
+                self.res_w_spin.setValue(1920)
+                self.res_h_spin.setValue(1080)
+                self.res_w_spin.setEnabled(False)
+                self.res_h_spin.setEnabled(False)
+            else:
+                # custom
+                self.res_w_spin.setEnabled(True)
+                self.res_h_spin.setEnabled(True)
+        self.res_combo.currentIndexChanged.connect(_on_res_combo)
+        # set initial selection based on provided resolution
+        try:
+            rw, rh = int(record_path and 640 or 640), int(record_path and 480 or 480)
+        except Exception:
+            rw, rh = 640, 480
+        # if caller passed 'record_path' arg in place of resolution, fall back
+        if isinstance(postroll, int):
+            pass
+        # caller will set values after creation in open_settings_dialog
 
         # Record path
         hl2 = QHBoxLayout()
@@ -1038,6 +1213,30 @@ class SettingsDialog(QDialog):
         self.nt_key_edit = QLineEdit(nt_bool_key)
         hl_nt.addWidget(self.nt_key_edit)
         layout.addLayout(hl_nt)
+
+        # initialize resolution UI from provided values if available
+        try:
+            rw, rh = int(resolution[0]), int(resolution[1])
+        except Exception:
+            rw, rh = 640, 480
+        # select a preset if it matches
+        if rw == 640 and rh == 480:
+            self.res_combo.setCurrentText('640x480')
+        elif rw == 1280 and rh == 720:
+            self.res_combo.setCurrentText('1280x720')
+        elif rw == 1920 and rh == 1080:
+            self.res_combo.setCurrentText('1920x1080')
+        else:
+            self.res_combo.setCurrentText('Custom')
+            self.res_w_spin.setValue(rw)
+            self.res_h_spin.setValue(rh)
+        # ensure Custom enables fields
+        if self.res_combo.currentText() == 'Custom':
+            self.res_w_spin.setEnabled(True)
+            self.res_h_spin.setEnabled(True)
+        else:
+            self.res_w_spin.setEnabled(False)
+            self.res_h_spin.setEnabled(False)
 
         # dialog buttons + Export/Reset in a single bottom row
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1083,8 +1282,8 @@ class SettingsDialog(QDialog):
                 except Exception:
                     pass
                 # apply defaults
-                parent._nt_server_ip = "10.0.67.2"
-                parent.nt_ip_edit.setText("")
+                parent._nt_server_ip = "10.0.67.1"
+                parent.nt_ip_edit.setText("67")
                 parent._postroll_seconds = 2
                 try:
                     default_videos = Path.home() / 'Videos'
