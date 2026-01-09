@@ -1,2 +1,6 @@
 pynetworktables
 opencv-python
+pygrabber
+PyQt5
+numpy
+pywin32
