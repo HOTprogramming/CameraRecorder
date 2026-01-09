@@ -37,13 +37,15 @@ def probe_cameras(max_index: int = 10):
         # pygrabber unavailable or failed — fall back to probing with OpenCV
         available = []
         for i in range(max_index):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)  # CAP_DSHOW helps on Windows; safe elsewhere
-            if cap is not None and cap.isOpened():
-                ret, _ = cap.read()
-                if ret:
-                    available.append((i, f"Camera {i}"))
-            if cap is not None:
-                cap.release()
+            try:
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                if cap is not None:
+                    ret, _ = cap.read()
+                    if ret:
+                        available.append((i, f"Camera {i}"))
+                    cap.release()
+            except Exception:
+                pass
         return available
 
 
@@ -62,6 +64,7 @@ class CameraApp(QWidget):
         self._record_start_ts = None
         self.recording = False
         self.record_writer = None
+        self._record_writer_open = False
         # lock to protect record buffer when using background threads
         self._record_lock = threading.Lock()
         # timestamp when current recording started (for on-frame timer)
@@ -504,7 +507,7 @@ class CameraApp(QWidget):
         except Exception:
             now = time.time()
 
-        # draw recording status and elapsed time on the frame (so it's saved)
+        # draw recording status and elapsed time on the frame (display and recording)
         try:
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.8
@@ -525,24 +528,33 @@ class CameraApp(QWidget):
         except Exception:
             pass
 
-        # If recording or post-roll active, buffer the timestamped frame (no live writing)
+        # If recording or post-roll active, buffer or write the timestamped frame
         if getattr(self, 'recording', False) or getattr(self, '_postroll_active', False):
             ts = now
-            try:
-                with self._record_lock:
-                    self._record_frames.append((ts, frame.copy()))
-            except Exception:
+            # If VideoWriter is open, write directly; otherwise buffer
+            if getattr(self, '_record_writer_open', False) and self.record_writer:
+                try:
+                    self.record_writer.write(frame)
+                except Exception as e:
+                    print(f"[REC] VideoWriter write failed: {e}")
+            else:
+                # Fallback: buffer frames in memory
                 try:
                     with self._record_lock:
-                        self._record_frames.append((ts, frame))
+                        self._record_frames.append((ts, frame.copy()))
                 except Exception:
-                    pass
+                    try:
+                        with self._record_lock:
+                            self._record_frames.append((ts, frame))
+                    except Exception:
+                        pass
         else:
             # maintain ring buffer when not recording (pre-roll)
+            # Reduce copies: only copy if we need to preserve the frame
             try:
-                self.ring_buffer.add_frame(frame.copy())
-            except Exception:
                 self.ring_buffer.add_frame(frame)
+            except Exception:
+                pass
 
         # If not in manual mode, read network Teleop flag and start/stop recording accordingly
         try:
@@ -703,14 +715,38 @@ class CameraApp(QWidget):
         for i, frm in enumerate(warm):
             # timestamp such that last warm frame is slightly before now
             ts_i = now - float(n_w - i) / fps_est
-            try:
-                rec_frames.append((ts_i, frm.copy()))
-            except Exception:
-                rec_frames.append((ts_i, frm))
+            rec_frames.append((ts_i, frm))
 
-        with self._record_lock:
-            self._record_frames = rec_frames
-            self._record_start_ts = self._record_frames[0][0] if self._record_frames else now
+        # Open VideoWriter for incremental writing
+        try:
+            first_frame = warm[0] if warm else None
+            if first_frame is None:
+                # If no pre-roll frames, we'll write on first frame in update_frame
+                h, w = 480, 640
+            else:
+                h, w = first_frame.shape[:2]
+            
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
+            self.record_writer = cv2.VideoWriter(filename, fourcc, fps_est, (w, h))
+            if self.record_writer and self.record_writer.isOpened():
+                self._record_writer_open = True
+                # Write pre-roll frames
+                for _, frm in rec_frames:
+                    try:
+                        self.record_writer.write(frm)
+                    except Exception:
+                        pass
+                print(f"[REC] VideoWriter opened, wrote {len(rec_frames)} pre-roll frames")
+            else:
+                print(f"[REC] VideoWriter failed to open, falling back to buffering")
+                self._record_writer_open = False
+                with self._record_lock:
+                    self._record_frames = rec_frames
+        except Exception as e:
+            print(f"[REC] VideoWriter init exception: {e}, falling back to buffering")
+            self._record_writer_open = False
+            with self._record_lock:
+                self._record_frames = rec_frames
         self._desired_filename = filename
         self.recording = True
         self._rec_start_time = time.time()
@@ -1011,12 +1047,21 @@ class CameraApp(QWidget):
         self.setWindowTitle(f"PyQt5 Camera Switcher - Post-roll ({seconds}s)")
 
     def _finalize_recording(self):
-        """Internal: swap buffered frames out and offload encoding/writing to a background thread."""
-        # swap buffers under lock so recording can continue independently
+        """Internal: close writer and finalize recording."""
+        # Close the active VideoWriter if open
+        try:
+            if self._record_writer_open and self.record_writer:
+                self.record_writer.release()
+                self._record_writer_open = False
+                self.record_writer = None
+                print(f"[REC] VideoWriter closed and released")
+        except Exception as e:
+            print(f"[REC] error closing VideoWriter: {e}")
+
+        # Check if there are any buffered frames (post-roll buffer)
         try:
             with self._record_lock:
                 frames = list(getattr(self, '_record_frames', []))
-                # empty the main buffer for future recordings
                 self._record_frames = []
         except Exception:
             frames = list(getattr(self, '_record_frames', []))
@@ -1024,6 +1069,39 @@ class CameraApp(QWidget):
                 self._record_frames = []
             except Exception:
                 pass
+
+        # If VideoWriter was used and no buffered frames, finalize immediately
+        if self._record_writer_open == False and len(frames) == 0:
+            # Already written to disk, just clean up UI
+            self.recording = False
+            self._postroll_active = False
+            self._rec_start_time = None
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.setWindowTitle("PyQt5 Camera Switcher")
+            filename = getattr(self, '_desired_filename', f'record_{self.current_camera_index}_{int(time.time())}.mp4')
+            print(f"[REC] Recording finalized (disk write): {filename}")
+            # Open the file
+            try:
+                os.startfile(filename)
+            except Exception:
+                pass
+            return
+
+        # If there are buffered frames (from post-roll or fallback mode), encode them
+        if len(frames) == 0:
+            # No frames to write
+            self.recording = False
+            self._postroll_active = False
+            self._rec_start_time = None
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.setWindowTitle("PyQt5 Camera Switcher")
+            print("[REC] finalize called but no frames to write")
+            return
+
+        filename = getattr(self, '_desired_filename', f'record_{self.current_camera_index}_{int(time.time())}.mp4')
+        print(f"[REC] Finalizing buffered frames in background: frames={len(frames)}, filename={filename}")
 
         # reset UI/state immediately
         self.recording = False
@@ -1033,15 +1111,7 @@ class CameraApp(QWidget):
         self.stop_btn.setEnabled(False)
         self.setWindowTitle("PyQt5 Camera Switcher")
 
-        n = len(frames)
-        if n == 0:
-            print("[REC] finalize called but no frames to write")
-            return
-
-        filename = getattr(self, '_desired_filename', f'record_{self.current_camera_index}_{int(time.time())}.mp4')
-        print(f"[REC] Finalizing recording in background: frames={n}, filename={filename}")
-
-        # start background thread to encode & save
+        # start background thread to encode & save buffered frames
         try:
             t = threading.Thread(target=self._encode_and_save, args=(frames, filename))
             t.daemon = True
@@ -1082,7 +1152,7 @@ class CameraApp(QWidget):
             h, w = first_frame.shape[:2]
 
             print(f"[ENC] encoding {n} frames span={span:.3f} fps={fps:.2f} -> {filename}")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
             try:
                 writer = cv2.VideoWriter(filename, fourcc, fps, (w, h))
                 if not writer.isOpened():
