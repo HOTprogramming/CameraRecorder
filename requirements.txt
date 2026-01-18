@@ -1,5 +1,6 @@
 pynetworktables
 opencv-python
+cv2-enumerate-cameras
 pygrabber
 PyQt5
 numpy

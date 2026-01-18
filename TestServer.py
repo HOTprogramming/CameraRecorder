@@ -10,7 +10,7 @@ while True:
         break
     elif a == "r":
         print("Recording")
-        sd.putBoolean("Enabled", True)
+        sd.putBoolean("Teleop", True)
     elif a == "s":
         print("Stopped Recording")
-        sd.putBoolean("Enabled", False)
+        sd.putBoolean("Teleop", False)
