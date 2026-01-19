@@ -3,32 +3,94 @@ from pathlib import Path
 
 import cv2
 
-def win_vs_linux_capture(camera_index: int):
-    if(sys.platform.startswith("win")):
-        return cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
-    else:
-        return cv2.VideoCapture(int(camera_index), cv2.CAP_V4L2)
+def _try_open_index(camera_index: int):
+    idx = int(camera_index)
+    if sys.platform.startswith("win"):
+        return cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+    if sys.platform.startswith("linux"):
+        return cv2.VideoCapture(idx, cv2.CAP_V4L2)
+    return cv2.VideoCapture(idx)
 
-def open_capture(camera_index: int, *, width: int = 1280, height: int = 720):
+
+def _try_open_gstreamer_mjpg(camera_index: int, *, width: int, height: int, fps: int, decoder: str):
     """
-    Open a camera by index. Tries CAP_DSHOW first (works well for small indices),
-    then falls back to default backend (needed for some cv2_enumerate_cameras indices).
+    Jetson/Linux fast path: v4l2src (MJPG) -> (nvjpegdec/jpegdec) -> appsink
+
+    Returns cv2.VideoCapture or None.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+
+    idx = int(camera_index)
+    dev = f"/dev/video{idx}"
+    # OpenCV expects BGR frames from appsink
+    pipeline = (
+        f'v4l2src device={dev} ! '
+        f'image/jpeg,width={int(width)},height={int(height)},framerate={int(fps)}/1 ! '
+        f'{decoder} ! videoconvert ! video/x-raw,format=BGR ! '
+        'appsink drop=true sync=false max-buffers=1'
+    )
+    cap = None
+    try:
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if cap is not None and cap.isOpened():
+            return cap
+    except Exception:
+        pass
+    try:
+        if cap is not None:
+            cap.release()
+    except Exception:
+        pass
+    return None
+
+
+def open_capture(camera_index: int, *, width: int = 1280, height: int = 720, fps: int = 30):
+    """
+    Open a camera by index.
+
+    - Windows: uses CAP_DSHOW
+    - Linux: prefers a GStreamer MJPG decode pipeline (nvjpegdec -> jpegdec fallback),
+      then falls back to CAP_V4L2.
+
     Returns cv2.VideoCapture or None.
     """
     cap = None
     try:
-        cap = win_vs_linux_capture(camera_index)
-        if not cap.isOpened():
-            cap.release()
-            cap = win_vs_linux_capture(camera_index)
+        # clamp fps to a sane range
+        try:
+            fps_i = int(float(fps))
+        except Exception:
+            fps_i = 30
+        if fps_i < 1:
+            fps_i = 1
+        if fps_i > 240:
+            fps_i = 240
 
-        if not cap.isOpened():
-            cap.release()
+        # Jetson/Linux: try GStreamer decode first (best performance with MJPG cameras)
+        if sys.platform.startswith("linux"):
+            cap = _try_open_gstreamer_mjpg(camera_index, width=width, height=height, fps=fps_i, decoder="nvjpegdec")
+            if cap is None:
+                cap = _try_open_gstreamer_mjpg(camera_index, width=width, height=height, fps=fps_i, decoder="jpegdec")
+
+        if cap is None:
+            cap = _try_open_index(camera_index)
+            if cap is not None and not cap.isOpened():
+                cap.release()
+                cap = _try_open_index(camera_index)
+
+        if cap is None or not cap.isOpened():
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
             return None
 
         try:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+            cap.set(cv2.CAP_PROP_FPS, int(fps_i))
             cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         except Exception:
             pass

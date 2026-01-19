@@ -48,6 +48,7 @@ class Settings:
 
     capture_width: int = 1280
     capture_height: int = 720
+    capture_fps: int = 30
 
     stream_host: str = "127.0.0.1"
     stream_port: int = 8765
@@ -71,12 +72,28 @@ class FrameWriter:
         self.output = None
         if sys.platform.startswith("linux"):
             try:
+                # Derive sane encoder parameters for the target FPS.
+                iframe = int(round(fps_f)) if fps_f > 0 else 30
+                if iframe < 1:
+                    iframe = 1
+                if iframe > 240:
+                    iframe = 240
+
+                # Rough bitrate scaling: 8Mbps at 30fps; scale with fps.
+                bitrate = int(8_000_000 * (fps_f / 30.0))
+                if bitrate < 2_000_000:
+                    bitrate = 2_000_000
+                if bitrate > 60_000_000:
+                    bitrate = 60_000_000
+
                 # Quote the location for safety (spaces etc.)
                 loc = str(file_name).replace('"', "")
                 pipeline = (
-                    "appsrc ! videoconvert ! "
+                    "appsrc ! "
+                    f"video/x-raw,format=BGR,width={w},height={h},framerate={int(round(fps_f))}/1 ! "
+                    "videoconvert ! "
                     f"video/x-raw,format=I420,width={w},height={h},framerate={int(round(fps_f))}/1 ! "
-                    "nvv4l2h264enc insert-sps-pps=true iframeinterval=30 bitrate=8000000 ! "
+                    f"nvv4l2h264enc insert-sps-pps=true maxperf-enable=1 iframeinterval={iframe} bitrate={bitrate} ! "
                     "h264parse ! qtmux ! "
                     f'filesink location="{loc}" sync=false'
                 )
@@ -234,7 +251,7 @@ class Recorder:
         # overlay timer start (reset on recording start)
         self.overlay_start_time = time.time()
 
-        self.ring_buffer = RingBuffer(max(1, int(self.settings.pre_roll_seconds * 30)))
+        self.ring_buffer = RingBuffer(max(1, int(self.settings.pre_roll_seconds * max(1, self.settings.capture_fps))))
 
         self.writer: FrameWriter | None = None
         self.writer_thread: threading.Thread | None = None
@@ -270,13 +287,13 @@ class Recorder:
         # Prefer camera-reported FPS if it looks reasonable, otherwise use our estimate.
         try:
             fps = float(cap.get(cv2.CAP_PROP_FPS))
-            if 5.0 <= fps <= 120.0:
+            if 5.0 <= fps <= 240.0:
                 return fps
         except Exception:
             pass
         try:
             fps = float(getattr(self, "_fps_estimate", 30.0))
-            if 5.0 <= fps <= 120.0:
+            if 5.0 <= fps <= 240.0:
                 return fps
         except Exception:
             pass
@@ -327,6 +344,17 @@ class Recorder:
         except Exception:
             pass
 
+        # capture fps (used for requesting camera mode and pre-roll sizing)
+        try:
+            fps = int(float(settings_block.get("capture_fps", s.capture_fps)))
+            if fps < 1:
+                fps = 1
+            if fps > 240:
+                fps = 240
+            s.capture_fps = fps
+        except Exception:
+            pass
+
         # stream throttle (reduce CPU usage; only affects stream encoding rate)
         try:
             stream_cfg = cfg.get("stream", {}) if isinstance(cfg.get("stream"), dict) else {}
@@ -368,7 +396,7 @@ class Recorder:
             self.settings = new_settings
             # update ring buffer size if needed
             try:
-                new_size = max(1, int(self.settings.pre_roll_seconds * 30))
+                new_size = max(1, int(self.settings.pre_roll_seconds * max(1, self.settings.capture_fps)))
                 if new_size != self.ring_buffer.size:
                     old_frames = self.ring_buffer.get_frames()
                     self.ring_buffer = RingBuffer(new_size)
@@ -409,7 +437,12 @@ class Recorder:
                 print("[CAM] cannot switch while recording/buffering")
                 return False
 
-        new_cap = open_capture(camera_index, width=self.settings.capture_width, height=self.settings.capture_height)
+        new_cap = open_capture(
+            camera_index,
+            width=self.settings.capture_width,
+            height=self.settings.capture_height,
+            fps=self.settings.capture_fps,
+        )
         if new_cap is None:
             print(f"[CAM] failed to open camera {camera_index}")
             return False
@@ -420,7 +453,7 @@ class Recorder:
             self.settings.camera_index = int(camera_index)
             # reset ring buffer for new camera
             try:
-                self.ring_buffer = RingBuffer(max(1, int(self.settings.pre_roll_seconds * 30)))
+                self.ring_buffer = RingBuffer(max(1, int(self.settings.pre_roll_seconds * max(1, self.settings.capture_fps))))
             except Exception:
                 pass
 
@@ -760,9 +793,14 @@ class Recorder:
             pass
 
         # init camera
-        self.cap = open_capture(self.settings.camera_index, width=self.settings.capture_width, height=self.settings.capture_height)
+        self.cap = open_capture(
+            self.settings.camera_index,
+            width=self.settings.capture_width,
+            height=self.settings.capture_height,
+            fps=self.settings.capture_fps,
+        )
         if self.cap is None:
-            self.cap = open_capture(0, width=self.settings.capture_width, height=self.settings.capture_height)
+            self.cap = open_capture(0, width=self.settings.capture_width, height=self.settings.capture_height, fps=self.settings.capture_fps)
             self.settings.camera_index = 0
         if self.cap is None:
             raise RuntimeError("Could not open any camera.")
