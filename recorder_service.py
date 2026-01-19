@@ -288,19 +288,37 @@ class Recorder:
             return
 
     def _record_fps(self, cap) -> float:
-        # Prefer camera-reported FPS if it looks reasonable, otherwise use our estimate.
+        # IMPORTANT:
+        # On Linux (especially with GStreamer/V4L2), CAP_PROP_FPS is often wrong (commonly reports 30),
+        # and using the "requested" FPS can make playback faster than realtime if the camera can't sustain it.
+        # The best approximation is the *measured* capture rate from recent frames.
+
+        # 1) If we have enough samples, prefer the measured FPS.
+        try:
+            samples = getattr(self, "_fps_samples", None)
+            est = float(getattr(self, "_fps_estimate", 0.0))
+            if samples is not None and len(samples) >= 15 and 5.0 <= est <= 240.0:
+                return est
+        except Exception:
+            pass
+
+        # 2) Try the camera-reported FPS (may be unreliable).
         try:
             fps = float(cap.get(cv2.CAP_PROP_FPS))
             if 5.0 <= fps <= 240.0:
                 return fps
         except Exception:
             pass
+
+        # 3) Fall back to the requested capture FPS from settings, if present.
         try:
-            fps = float(getattr(self, "_fps_estimate", 30.0))
+            fps = float(getattr(self.settings, "capture_fps", 30))
             if 5.0 <= fps <= 240.0:
                 return fps
         except Exception:
             pass
+
+        # 4) Last resort.
         return 30.0
 
     def load_settings_from_config(self) -> Settings:
@@ -604,8 +622,9 @@ class Recorder:
                 continue
 
             # update capture FPS estimate (used for correct recording speed)
+            # perf_counter is monotonic/high-resolution (more stable for FPS calculation)
             try:
-                self._update_fps_estimate(time.time())
+                self._update_fps_estimate(time.perf_counter())
             except Exception:
                 pass
 
