@@ -69,9 +69,20 @@ def open_capture(camera_index: int, *, width: int = 1280, height: int = 720, fps
 
         # Jetson/Linux: try GStreamer decode first (best performance with MJPG cameras)
         if sys.platform.startswith("linux"):
-            cap = _try_open_gstreamer_mjpg(camera_index, width=width, height=height, fps=fps_i, decoder="nvjpegdec")
-            if cap is None:
-                cap = _try_open_gstreamer_mjpg(camera_index, width=width, height=height, fps=fps_i, decoder="jpegdec")
+            # Many UVC cameras only support specific FPS values (e.g. 30/60/120).
+            # If you request an unsupported FPS (like 129), the pipeline may fail to open.
+            fps_candidates = [fps_i, 120, 60, 30, 25, 15]
+            # keep order, remove duplicates
+            seen_fps: set[int] = set()
+            fps_candidates = [x for x in fps_candidates if not (x in seen_fps or seen_fps.add(x))]
+
+            for f_try in fps_candidates:
+                cap = _try_open_gstreamer_mjpg(camera_index, width=width, height=height, fps=f_try, decoder="nvjpegdec")
+                if cap is None:
+                    cap = _try_open_gstreamer_mjpg(camera_index, width=width, height=height, fps=f_try, decoder="jpegdec")
+                if cap is not None and cap.isOpened():
+                    fps_i = f_try
+                    break
 
         if cap is None:
             cap = _try_open_index(camera_index)
