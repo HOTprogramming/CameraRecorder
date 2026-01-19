@@ -28,7 +28,9 @@ def _try_open_gstreamer_mjpg(camera_index: int, *, width: int, height: int, fps:
         f'v4l2src device={dev} ! '
         f'image/jpeg,width={int(width)},height={int(height)},framerate={int(fps)}/1 ! '
         f'{decoder} ! videoconvert ! video/x-raw,format=BGR ! '
-        'appsink drop=true sync=false max-buffers=1'
+        # For recording correctness, do NOT drop frames here.
+        # Dropping frames shortens the video duration and makes playback appear "faster than realtime".
+        'appsink drop=false sync=false max-buffers=4'
     )
     cap = None
     try:
