@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import socket
 import struct
 import threading
@@ -60,12 +61,44 @@ class FrameWriter:
         self.file_name = file_name
         self.frame_queue: Queue = Queue()
         self.running = True
-        # Keep master recordings as mp4v (fast + widely supported by desktop players).
-        # Browsers often can't play mp4v; we generate an H.264 "_web.mp4" copy after finalize via ffmpeg.
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.output = cv2.VideoWriter(file_name, fourcc, float(fps), (int(frame_width), int(frame_height)))
+
+        w = int(frame_width)
+        h = int(frame_height)
+        fps_f = float(fps) if fps and fps > 0 else 30.0
+
+        # On Jetson/Linux, prefer hardware H.264 encode via GStreamer (nvv4l2h264enc).
+        # This is the biggest performance win for high-res/high-fps recording.
+        self.output = None
+        if sys.platform.startswith("linux"):
+            try:
+                # Quote the location for safety (spaces etc.)
+                loc = str(file_name).replace('"', "")
+                pipeline = (
+                    "appsrc ! videoconvert ! "
+                    f"video/x-raw,format=I420,width={w},height={h},framerate={int(round(fps_f))}/1 ! "
+                    "nvv4l2h264enc insert-sps-pps=true iframeinterval=30 bitrate=8000000 ! "
+                    "h264parse ! qtmux ! "
+                    f'filesink location="{loc}" sync=false'
+                )
+                out = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps_f, (w, h), True)
+                if out is not None and out.isOpened():
+                    self.output = out
+                else:
+                    try:
+                        if out is not None:
+                            out.release()
+                    except Exception:
+                        pass
+            except Exception:
+                self.output = None
+
+        # Fallback: OpenCV software mp4v (Windows / non-GStreamer builds)
+        if self.output is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.output = cv2.VideoWriter(file_name, fourcc, fps_f, (w, h))
+
         if self.output is None or not self.output.isOpened():
-            raise RuntimeError("VideoWriter failed to open (mp4v).")
+            raise RuntimeError("VideoWriter failed to open (gstreamer/mp4v).")
 
     def write_frames(self):
         while self.running:
