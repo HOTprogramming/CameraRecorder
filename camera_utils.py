@@ -1,22 +1,54 @@
-import cv2
+import sys
 from pathlib import Path
+
+import cv2
 
 
 def open_capture(camera_index: int, *, width: int = 1280, height: int = 720):
     """
-    Open a camera by index. Tries CAP_DSHOW first (works well for small indices),
-    then falls back to default backend (needed for some cv2_enumerate_cameras indices).
+    Open a camera by index.
+
+    - Windows: try CAP_DSHOW (then fallback backends)
+    - Linux: try CAP_V4L2 (then fallback)
+    - Other: default backend
+
     Returns cv2.VideoCapture or None.
     """
+    idx = int(camera_index)
+
+    # Pick sensible backends per-OS
+    if sys.platform.startswith("win"):
+        backend_candidates = [cv2.CAP_DSHOW, getattr(cv2, "CAP_MSMF", 0), 0]
+    elif sys.platform.startswith("linux"):
+        backend_candidates = [getattr(cv2, "CAP_V4L2", 0), 0]
+    else:
+        backend_candidates = [0]
+
     cap = None
     try:
-        cap = cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap.release()
-            cap = cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
+        for backend in backend_candidates:
+            try:
+                if backend:
+                    cap = cv2.VideoCapture(idx, int(backend))
+                else:
+                    cap = cv2.VideoCapture(idx)
 
-        if not cap.isOpened():
-            cap.release()
+                if cap is not None and cap.isOpened():
+                    break
+            except Exception:
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+                cap = None
+
+        if cap is None or not cap.isOpened():
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
             return None
 
         try:
@@ -45,9 +77,44 @@ def enumerate_camera_choices() -> list[tuple[str, int]]:
     """
     Returns list of (label, camera_index) pairs.
     Uses cv2_enumerate_cameras if available; falls back to probing indices 0..9.
-    De-dupes Windows duplicate interfaces by stable device path (before '#{...}').
+
+    - Windows: de-dupe duplicate interfaces by stable device path (before '#{...}').
+    - Linux: prefer listing /dev/video* devices (with friendly names if available).
     """
     choices: list[tuple[str, int]] = []
+
+    # Linux: enumerate /dev/video* first (more reliable than "index probing")
+    if sys.platform.startswith("linux"):
+        try:
+            devs = sorted(Path("/dev").glob("video*"), key=lambda p: p.name)
+            out: list[tuple[str, int]] = []
+            seen: set[int] = set()
+            for p in devs:
+                # /dev/video0 -> 0
+                suffix = p.name.replace("video", "", 1)
+                if not suffix.isdigit():
+                    continue
+                idx = int(suffix)
+                if idx in seen:
+                    continue
+                seen.add(idx)
+
+                name = f"Video{idx}"
+                try:
+                    sys_name = Path(f"/sys/class/video4linux/video{idx}/name")
+                    if sys_name.exists():
+                        txt = sys_name.read_text(encoding="utf-8", errors="ignore").strip()
+                        if txt:
+                            name = txt
+                except Exception:
+                    pass
+
+                out.append((f"{name} ({idx})", idx))
+
+            if out:
+                return out
+        except Exception:
+            pass
 
     try:
         from cv2_enumerate_cameras import enumerate_cameras  # type: ignore
@@ -64,14 +131,14 @@ def enumerate_camera_choices() -> list[tuple[str, int]]:
                 pid = getattr(cam, "pid", None)
 
                 stable_path = ""
-                if path:
+                if sys.platform.startswith("win") and path:
                     lp = path.lower()
                     if lp.endswith("\\global"):
                         lp = lp[: -len("\\global")]
                     stable_path = lp.split("#{", 1)[0].strip()
 
                 if stable_path:
-                    key = ("stable_path", stable_path)
+                    key = ("stable_path", stable_path)  # Windows de-dupe
                 elif vid is not None and pid is not None:
                     key = ("vidpid", int(vid), int(pid), name)
                 else:
