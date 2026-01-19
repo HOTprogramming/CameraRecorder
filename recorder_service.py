@@ -118,15 +118,23 @@ class FrameWriter:
             raise RuntimeError("VideoWriter failed to open (gstreamer/mp4v).")
 
     def write_frames(self):
-        while self.running:
+        try:
+            while self.running:
+                try:
+                    frame = self.frame_queue.get(timeout=0.1)
+                except Empty:
+                    continue
+                if frame is None:
+                    break
+                try:
+                    self.output.write(frame)
+                except Exception:
+                    pass
+        finally:
+            # IMPORTANT (avoids segfaults):
+            # Only release the VideoWriter from the same thread that is writing frames.
             try:
-                frame = self.frame_queue.get(timeout=0.1)
-            except Empty:
-                continue
-            if frame is None:
-                break
-            try:
-                self.output.write(frame)
+                self.output.release()
             except Exception:
                 pass
 
@@ -140,10 +148,6 @@ class FrameWriter:
         self.running = False
         try:
             self.frame_queue.put(None)
-        except Exception:
-            pass
-        try:
-            self.output.release()
         except Exception:
             pass
 
@@ -511,7 +515,9 @@ class Recorder:
                 pass
         if t:
             try:
-                t.join(timeout=2)
+                # Give the writer thread time to flush and release safely.
+                # (Releasing from this thread can segfault when using GStreamer/Jetson encoders.)
+                t.join(timeout=10)
             except Exception:
                 pass
 
