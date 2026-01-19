@@ -17,13 +17,17 @@ Defaults:
 from __future__ import annotations
 
 import html
+import os
+from pathlib import Path
 import socket
 import struct
+import subprocess
+import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote, unquote
 
 from camera_utils import enumerate_camera_choices
 from config_utils import load_config, save_config
@@ -116,6 +120,140 @@ def _get_cfg_blocks() -> tuple[dict, dict, dict, dict]:
     return cfg, settings, nt, camera
 
 
+def _recordings_dir_from_config() -> Path:
+    cfg = load_config()
+    settings = cfg.get("settings", {}) if isinstance(cfg.get("settings"), dict) else {}
+    out_dir = settings.get("output_dir") or settings.get("record_path")
+    if not out_dir:
+        out_dir = str(Path.cwd() / "output")
+    try:
+        p = Path(str(out_dir))
+    except Exception:
+        p = Path.cwd() / "output"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
+
+def _list_recordings(dir_path: Path) -> list[Path]:
+    try:
+        # list master recordings; ignore generated web copies
+        files = [
+            p
+            for p in dir_path.iterdir()
+            if p.is_file()
+            and p.suffix.lower() == ".mp4"
+            and not p.name.lower().endswith("_web.mp4")
+        ]
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return files
+    except Exception:
+        return []
+
+
+_TRANSCODE_LOCK = threading.Lock()
+_TRANSCODE_IN_PROGRESS: set[str] = set()
+
+
+def _web_copy_path(master: Path) -> Path:
+    return master.with_name(master.stem + "_web.mp4")
+
+
+def _ffmpeg_config() -> tuple[str, str, int]:
+    """
+    Returns (ffmpeg_path, preset, crf).
+    """
+    cfg = load_config()
+    wt = cfg.get("web_transcode", {}) if isinstance(cfg.get("web_transcode"), dict) else {}
+    ffmpeg_path = str(wt.get("ffmpeg_path", "ffmpeg"))
+    preset = str(wt.get("preset", "veryfast"))
+    try:
+        crf = int(wt.get("crf", 23))
+    except Exception:
+        crf = 23
+    return ffmpeg_path, preset, crf
+
+
+def _ffmpeg_available(ffmpeg_path: str) -> bool:
+    try:
+        if shutil.which(ffmpeg_path):
+            return True
+        return Path(ffmpeg_path).exists()
+    except Exception:
+        return False
+
+
+def _ensure_web_copy_async(master: Path) -> tuple[Optional[Path], str]:
+    """
+    Ensure a browser-playable H.264 MP4 exists.
+
+    Returns (web_path if ready else None, status_message).
+    """
+    web = _web_copy_path(master)
+    try:
+        if web.exists() and web.stat().st_mtime >= master.stat().st_mtime:
+            return web, "ready"
+    except Exception:
+        pass
+
+    ffmpeg_path, preset, crf = _ffmpeg_config()
+    if not _ffmpeg_available(ffmpeg_path):
+        return None, "ffmpeg_not_found"
+
+    key = str(master)
+    with _TRANSCODE_LOCK:
+        if key in _TRANSCODE_IN_PROGRESS:
+            return None, "transcoding"
+        _TRANSCODE_IN_PROGRESS.add(key)
+
+    def _worker():
+        try:
+            # H.264 + faststart for browser playback; no audio
+            cmd = [
+                ffmpeg_path,
+                "-y",
+                "-i",
+                str(master),
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-preset",
+                preset,
+                "-crf",
+                str(crf),
+                str(web),
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        finally:
+            with _TRANSCODE_LOCK:
+                _TRANSCODE_IN_PROGRESS.discard(key)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return None, "transcoding_started"
+
+
+def _safe_join(base: Path, name: str) -> Optional[Path]:
+    # prevent path traversal
+    try:
+        name = name.replace("\\", "/")
+        if "/" in name or name.startswith("."):
+            return None
+        p = (base / name).resolve()
+        base_r = base.resolve()
+        if base_r not in p.parents and p != base_r:
+            return None
+        return p
+    except Exception:
+        return None
+
+
 class Handler(BaseHTTPRequestHandler):
     # set by main()
     store: FrameStore = None  # type: ignore[assignment]
@@ -147,6 +285,61 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _send_file_with_range(self, path: Path, content_type: str):
+        try:
+            size = path.stat().st_size
+        except Exception:
+            self._send_headers(404, "text/plain; charset=utf-8")
+            self.wfile.write(b"not found\n")
+            return
+
+        rng = self.headers.get("Range")
+        start = 0
+        end = size - 1
+        status = 200
+
+        if rng and rng.startswith("bytes="):
+            try:
+                spec = rng.split("=", 1)[1].strip()
+                a, b = spec.split("-", 1)
+                if a:
+                    start = int(a)
+                if b:
+                    end = int(b)
+                if start < 0:
+                    start = 0
+                if end >= size:
+                    end = size - 1
+                if start <= end:
+                    status = 206
+            except Exception:
+                start = 0
+                end = size - 1
+                status = 200
+
+        length = (end - start) + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        try:
+            with path.open("rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except Exception:
+            return
+
     def do_GET(self):  # noqa: N802
         u = urlparse(self.path)
 
@@ -155,13 +348,16 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(u.query)
             msg = (qs.get("msg", [""])[0] or "").strip()
             msg_html = f"<p style='color:#8f8'>{html.escape(msg)}</p>" if msg else ""
+            # include a small recordings list at bottom of the page
+            rec_dir = _recordings_dir_from_config()
+            rec_files = _list_recordings(rec_dir)[:25]
             self.wfile.write(
                 b"<!doctype html><html><head><meta charset='utf-8'>"
                 b"<title>Camera Stream</title>"
                 b"<style>body{background:#111;color:#ddd;font-family:sans-serif;margin:0}"
                 b".wrap{padding:16px}img{max-width:100%;height:auto;border:1px solid #333}"
                 b"button{margin-right:8px;margin-bottom:8px;padding:8px 12px}"
-                b"a{color:#7af}"
+                b"a{color:#7af}li{margin:6px 0}"
                 b"</style>"
                 b"</head><body><div class='wrap'>"
                 b"<h2>Camera Stream</h2>"
@@ -174,8 +370,24 @@ class Handler(BaseHTTPRequestHandler):
                 + msg_html.encode("utf-8") +
                 b"<p>If you see a broken image, start <code>recorder_service.py</code> first.</p>"
                 b"<img src='/mjpeg' />"
-                b"</div></body></html>"
             )
+            self.wfile.write(b"<h2 style='margin-top:24px'>Recordings</h2>")
+            self.wfile.write(b"<p><a href='/recordings'>View all recordings</a></p>")
+            if not rec_files:
+                self.wfile.write(b"<p>No recordings found.</p>")
+            else:
+                self.wfile.write(b"<ul>")
+                for p in rec_files:
+                    name = p.name
+                    display = html.escape(name)
+                    q = quote(name)
+                    self.wfile.write(
+                        f"<li><a href='/play?f={q}'>Play</a> | <a href='/download?f={q}'>Download</a> — {display}</li>".encode(
+                            "utf-8"
+                        )
+                    )
+                self.wfile.write(b"</ul>")
+            self.wfile.write(b"</div></body></html>")
             return
 
         if u.path == "/health":
@@ -198,6 +410,8 @@ class Handler(BaseHTTPRequestHandler):
             res = settings.get("resolution", {}) if isinstance(settings.get("resolution"), dict) else {}
             res_w = str(res.get("w", 1280))
             res_h = str(res.get("h", 720))
+            ffmpeg_path, preset, crf = _ffmpeg_config()
+            ff_ok = _ffmpeg_available(ffmpeg_path)
 
             self._send_headers(200, "text/html; charset=utf-8")
             self.wfile.write(
@@ -233,9 +447,129 @@ class Handler(BaseHTTPRequestHandler):
             _inp("NT boolean key", "nt_boolean_key", nt_key)
             _inp("Resolution width", "resolution_w", res_w)
             _inp("Resolution height", "resolution_h", res_h)
+            _inp("FFmpeg path (ffmpeg.exe)", "ffmpeg_path", ffmpeg_path)
+            _inp("FFmpeg preset", "ffmpeg_preset", preset)
+            _inp("FFmpeg crf", "ffmpeg_crf", str(crf))
+
+            if ff_ok:
+                self.wfile.write(b"<p style='color:#8f8'>FFmpeg: found</p>")
+            else:
+                self.wfile.write(b"<p style='color:#f88'>FFmpeg: NOT found (set path above)</p>")
 
             self.wfile.write(b"<button type='submit'>Save</button>")
             self.wfile.write(b"</form></div></body></html>")
+            return
+
+        if u.path == "/recordings":
+            rec_dir = _recordings_dir_from_config()
+            files = _list_recordings(rec_dir)
+            self._send_headers(200, "text/html; charset=utf-8")
+            self.wfile.write(
+                b"<!doctype html><html><head><meta charset='utf-8'>"
+                b"<title>Recordings</title>"
+                b"<style>body{background:#111;color:#ddd;font-family:sans-serif;margin:0}"
+                b".wrap{padding:16px}a{color:#7af}li{margin:6px 0}</style>"
+                b"</head><body><div class='wrap'>"
+                b"<h2>Recordings</h2>"
+                b"<p><a href='/'>Back</a></p>"
+            )
+            if not files:
+                self.wfile.write(b"<p>No recordings found.</p></div></body></html>")
+                return
+            self.wfile.write(b"<ul>")
+            for p in files[:250]:
+                name = p.name
+                display = html.escape(name)
+                q = quote(name)
+                self.wfile.write(
+                    f"<li><a href='/play?f={q}'>Play</a> | <a href='/download?f={q}'>Download</a> — {display}</li>".encode(
+                        "utf-8"
+                    )
+                )
+            self.wfile.write(b"</ul></div></body></html>")
+            return
+
+        if u.path == "/download":
+            qs = parse_qs(u.query)
+            f = (qs.get("f", [""])[0] or "").strip()
+            rec_dir = _recordings_dir_from_config()
+            p = _safe_join(rec_dir, unquote(f))
+            if not p or not p.exists():
+                self._send_headers(404, "text/plain; charset=utf-8")
+                self.wfile.write(b"not found\n")
+                return
+            self._send_file_with_range(p, "video/mp4")
+            return
+
+        if u.path == "/video":
+            qs = parse_qs(u.query)
+            f = (qs.get("f", [""])[0] or "").strip()
+            rec_dir = _recordings_dir_from_config()
+            master = _safe_join(rec_dir, unquote(f))
+            if not master or not master.exists():
+                self._send_headers(404, "text/plain; charset=utf-8")
+                self.wfile.write(b"not found\n")
+                return
+            web = _web_copy_path(master)
+            if not web.exists():
+                self._send_headers(404, "text/plain; charset=utf-8")
+                self.wfile.write(b"web copy not ready\n")
+                return
+            self._send_file_with_range(web, "video/mp4")
+            return
+
+        if u.path == "/play":
+            qs = parse_qs(u.query)
+            f = (qs.get("f", [""])[0] or "").strip()
+            rec_dir = _recordings_dir_from_config()
+            p = _safe_join(rec_dir, unquote(f))
+            if not p or not p.exists():
+                self._send_headers(404, "text/plain; charset=utf-8")
+                self.wfile.write(b"not found\n")
+                return
+            name = p.name
+            display = html.escape(name)
+            q = quote(name)
+
+            web, status = _ensure_web_copy_async(p)
+            self._send_headers(200, "text/html; charset=utf-8")
+            head = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<title>Play</title>"
+                "<style>body{background:#111;color:#ddd;font-family:sans-serif;margin:0}"
+                ".wrap{padding:16px}a{color:#7af}"
+                "video{max-width:100%;height:auto;border:1px solid #333}</style>"
+            )
+            if web is None and status in ("transcoding_started", "transcoding"):
+                head += "<meta http-equiv='refresh' content='2'>"
+            head += "</head><body><div class='wrap'>"
+            self.wfile.write(head.encode("utf-8"))
+            self.wfile.write(f"<h2>{display}</h2>".encode("utf-8"))
+            self.wfile.write(b"<p><a href='/recordings'>Back to recordings</a></p>")
+            self.wfile.write(b"<h3>Browser video player</h3>")
+
+            if web is not None and web.exists():
+                self.wfile.write(f"<video controls autoplay preload='metadata' src='/video?f={q}'></video>".encode("utf-8"))
+                self.wfile.write(b"<p>If it doesn't start, try reloading the page.</p>")
+            else:
+                if status == "ffmpeg_not_found":
+                    ffmpeg_path, _preset, _crf = _ffmpeg_config()
+                    self.wfile.write(
+                        b"<p><b>Cannot play in browser yet:</b> this recording is not in a browser-compatible codec.</p>"
+                        b"<p>Install FFmpeg and restart <code>web_stream.py</code>, then reload this page.</p>"
+                        b"<p>Download FFmpeg and add it to PATH, or set <code>web_transcode.ffmpeg_path</code> in config.json.</p>"
+                    )
+                    self.wfile.write(f"<p>Current ffmpeg_path: <code>{html.escape(ffmpeg_path)}</code></p>".encode("utf-8"))
+                    self.wfile.write(b"<p>Tip: open <a href='/settings'>Settings</a> and set the full path to ffmpeg.exe.</p>")
+                else:
+                    self.wfile.write(
+                        b"<p>Creating a browser-compatible copy now... please wait a few seconds.</p>"
+                        b"<p>This page will auto-refresh.</p>"
+                    )
+
+                self.wfile.write(f"<p><a href='/download?f={q}'>Download original file</a></p>".encode("utf-8"))
+
+            self.wfile.write(b"</div></body></html>")
             return
 
         if u.path == "/mjpeg":
@@ -286,6 +620,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg.setdefault("settings", {})
             cfg.setdefault("nt", {})
             cfg.setdefault("camera", {})
+            cfg.setdefault("web_transcode", {})
 
             pre = form.get("pre_roll_seconds", "").strip()
             buf = form.get("buffer_seconds", "").strip()
@@ -295,6 +630,9 @@ class Handler(BaseHTTPRequestHandler):
             cam_idx = form.get("camera_index", "").strip()
             rw = form.get("resolution_w", "").strip()
             rh = form.get("resolution_h", "").strip()
+            ffmpeg_path = form.get("ffmpeg_path", "").strip()
+            ffmpeg_preset = form.get("ffmpeg_preset", "").strip()
+            ffmpeg_crf = form.get("ffmpeg_crf", "").strip()
 
             try:
                 if pre != "":
@@ -325,6 +663,16 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["settings"].setdefault("resolution", {})
                     cfg["settings"]["resolution"]["w"] = w
                     cfg["settings"]["resolution"]["h"] = h
+            except Exception:
+                pass
+
+            if ffmpeg_path:
+                cfg["web_transcode"]["ffmpeg_path"] = ffmpeg_path
+            if ffmpeg_preset:
+                cfg["web_transcode"]["preset"] = ffmpeg_preset
+            try:
+                if ffmpeg_crf:
+                    cfg["web_transcode"]["crf"] = int(float(ffmpeg_crf))
             except Exception:
                 pass
 
