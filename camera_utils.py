@@ -3,52 +3,27 @@ from pathlib import Path
 
 import cv2
 
+def win_vs_linux_capture(camera_index: int):
+    if(sys.platform.startswith("win")):
+        return cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
+    else:
+        return cv2.VideoCapture(int(camera_index), cv2.CAP_V4L2)
 
 def open_capture(camera_index: int, *, width: int = 1280, height: int = 720):
     """
-    Open a camera by index.
-
-    - Windows: try CAP_DSHOW (then fallback backends)
-    - Linux: try CAP_V4L2 (then fallback)
-    - Other: default backend
-
+    Open a camera by index. Tries CAP_DSHOW first (works well for small indices),
+    then falls back to default backend (needed for some cv2_enumerate_cameras indices).
     Returns cv2.VideoCapture or None.
     """
-    idx = int(camera_index)
-
-    # Pick sensible backends per-OS
-    if sys.platform.startswith("win"):
-        backend_candidates = [cv2.CAP_DSHOW, getattr(cv2, "CAP_MSMF", 0), 0]
-    elif sys.platform.startswith("linux"):
-        backend_candidates = [getattr(cv2, "CAP_V4L2", 0), 0]
-    else:
-        backend_candidates = [0]
-
     cap = None
     try:
-        for backend in backend_candidates:
-            try:
-                if backend:
-                    cap = cv2.VideoCapture(idx, int(backend))
-                else:
-                    cap = cv2.VideoCapture(idx)
+        cap = win_vs_linux_capture(camera_index)
+        if not cap.isOpened():
+            cap.release()
+            cap = win_vs_linux_capture(camera_index)
 
-                if cap is not None and cap.isOpened():
-                    break
-            except Exception:
-                try:
-                    if cap is not None:
-                        cap.release()
-                except Exception:
-                    pass
-                cap = None
-
-        if cap is None or not cap.isOpened():
-            try:
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                pass
+        if not cap.isOpened():
+            cap.release()
             return None
 
         try:
@@ -71,7 +46,6 @@ def open_capture(camera_index: int, *, width: int = 1280, height: int = 720):
         except Exception:
             pass
         return None
-
 
 def enumerate_camera_choices() -> list[tuple[str, int]]:
     """

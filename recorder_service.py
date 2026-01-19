@@ -17,6 +17,7 @@ import socket
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -208,6 +209,46 @@ class Recorder:
 
         self.stream_server = VideoStreamServer(self.settings.stream_host, self.settings.stream_port)
 
+        # Capture FPS estimate (used so recorded videos don't play too fast/slow)
+        self._last_frame_ts: float | None = None
+        self._fps_samples: deque[float] = deque(maxlen=60)
+        self._fps_estimate: float = 30.0
+
+    def _update_fps_estimate(self, ts: float) -> None:
+        try:
+            last = self._last_frame_ts
+            self._last_frame_ts = ts
+            if last is None:
+                return
+            dt = ts - last
+            # ignore crazy deltas (camera reconnect, stalls, etc.)
+            if dt <= 0.0 or dt > 1.0:
+                return
+            fps = 1.0 / dt
+            if fps < 1.0 or fps > 240.0:
+                return
+            self._fps_samples.append(float(fps))
+            if self._fps_samples:
+                self._fps_estimate = sum(self._fps_samples) / float(len(self._fps_samples))
+        except Exception:
+            return
+
+    def _record_fps(self, cap) -> float:
+        # Prefer camera-reported FPS if it looks reasonable, otherwise use our estimate.
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+            if 5.0 <= fps <= 120.0:
+                return fps
+        except Exception:
+            pass
+        try:
+            fps = float(getattr(self, "_fps_estimate", 30.0))
+            if 5.0 <= fps <= 120.0:
+                return fps
+        except Exception:
+            pass
+        return 30.0
+
     def load_settings_from_config(self) -> Settings:
         cfg = load_config()
         settings_block = cfg.get("settings", {}) if isinstance(cfg.get("settings"), dict) else {}
@@ -377,7 +418,10 @@ class Recorder:
             return
         h, w = last.shape[:2]
         try:
-            self.writer = FrameWriter(file_path, w, h, fps=30.0)
+            with self.lock:
+                cap = self.cap
+            fps = self._record_fps(cap) if cap is not None else 30.0
+            self.writer = FrameWriter(file_path, w, h, fps=float(fps))
         except Exception as e:
             print(f"[REC] failed to start writer: {e}")
             self.writer = None
@@ -487,6 +531,12 @@ class Recorder:
                 time.sleep(0.01)
                 continue
 
+            # update capture FPS estimate (used for correct recording speed)
+            try:
+                self._update_fps_estimate(time.time())
+            except Exception:
+                pass
+
             # state transitions (compute desired first so we can overlay it)
             desired = self._desired_recording_state()
             self._handle_transition(desired)
@@ -548,7 +598,8 @@ class Recorder:
                         self.current_recording_path = file_path
                     h, w = frame.shape[:2]
                     try:
-                        wtr = FrameWriter(file_path, w, h, fps=30.0)
+                        fps = self._record_fps(cap)
+                        wtr = FrameWriter(file_path, w, h, fps=float(fps))
                     except Exception as e:
                         print(f"[REC] failed to create writer: {e}")
                         # can't record; drop back to non-recording (but keep streaming preview)
