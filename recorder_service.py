@@ -89,9 +89,15 @@ class FrameWriter:
                 # Quote the location for safety (spaces etc.)
                 loc = str(file_name).replace('"', "")
                 pipeline = (
-                    "appsrc ! "
+                    # do-timestamp is critical: without timestamps, MP4 duration can be wrong
+                    # (looks like it only recorded the first buffered frames).
+                    "appsrc is-live=true do-timestamp=true format=time ! "
                     f"video/x-raw,format=BGR,width={w},height={h},framerate={int(round(fps_f))}/1 ! "
+                    "queue max-size-buffers=120 leaky=downstream ! "
                     "videoconvert ! "
+                    f"video/x-raw,format=I420,width={w},height={h},framerate={int(round(fps_f))}/1 ! "
+                    # Ensure a steady output rate (drops/duplicates if needed to match timestamps)
+                    "videorate ! "
                     f"video/x-raw,format=I420,width={w},height={h},framerate={int(round(fps_f))}/1 ! "
                     f"nvv4l2h264enc insert-sps-pps=true maxperf-enable=1 iframeinterval={iframe} bitrate={bitrate} ! "
                     "h264parse ! qtmux ! "
