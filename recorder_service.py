@@ -517,7 +517,7 @@ class Recorder:
             try:
                 # Give the writer thread time to flush and release safely.
                 # (Releasing from this thread can segfault when using GStreamer/Jetson encoders.)
-                t.join(timeout=10)
+                t.join()
             except Exception:
                 pass
 

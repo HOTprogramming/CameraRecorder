@@ -511,11 +511,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"not found\n")
                 return
             web = _web_copy_path(master)
-            if not web.exists():
-                self._send_headers(404, "text/plain; charset=utf-8")
-                self.wfile.write(b"web copy not ready\n")
-                return
-            self._send_file_with_range(web, "video/mp4")
+            # Prefer the browser-friendly web copy if it exists, otherwise serve the master.
+            # This allows Jetson H.264 masters to play immediately even without FFmpeg.
+            self._send_file_with_range(web if web.exists() else master, "video/mp4")
             return
 
         if u.path == "/play":
@@ -548,24 +546,24 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"<p><a href='/recordings'>Back to recordings</a></p>")
             self.wfile.write(b"<h3>Browser video player</h3>")
 
+            # Always try to play *something*: /video serves the web copy if ready, otherwise the master.
+            self.wfile.write(f"<video controls autoplay preload='metadata' src='/video?f={q}'></video>".encode("utf-8"))
+
             if web is not None and web.exists():
-                self.wfile.write(f"<video controls autoplay preload='metadata' src='/video?f={q}'></video>".encode("utf-8"))
-                self.wfile.write(b"<p>If it doesn't start, try reloading the page.</p>")
+                self.wfile.write(b"<p>Playing browser-ready copy.</p>")
             else:
-                if status == "ffmpeg_not_found":
+                if status in ("transcoding_started", "transcoding"):
+                    self.wfile.write(
+                        b"<p>Creating a browser-compatible copy in the background... this page will auto-refresh.</p>"
+                    )
+                elif status == "ffmpeg_not_found":
                     ffmpeg_path, _preset, _crf = _ffmpeg_config()
                     self.wfile.write(
-                        b"<p><b>Cannot play in browser yet:</b> this recording is not in a browser-compatible codec.</p>"
-                        b"<p>Install FFmpeg and restart <code>web_stream.py</code>, then reload this page.</p>"
-                        b"<p>Download FFmpeg and add it to PATH, or set <code>web_transcode.ffmpeg_path</code> in config.json.</p>"
+                        b"<p>Trying to play the original file directly.</p>"
+                        b"<p>If playback is blank, this file is likely not browser-compatible.</p>"
                     )
                     self.wfile.write(f"<p>Current ffmpeg_path: <code>{html.escape(ffmpeg_path)}</code></p>".encode("utf-8"))
                     self.wfile.write(b"<p>Tip: open <a href='/settings'>Settings</a> and set the full path to ffmpeg.exe.</p>")
-                else:
-                    self.wfile.write(
-                        b"<p>Creating a browser-compatible copy now... please wait a few seconds.</p>"
-                        b"<p>This page will auto-refresh.</p>"
-                    )
 
                 self.wfile.write(f"<p><a href='/download?f={q}'>Download original file</a></p>".encode("utf-8"))
 
